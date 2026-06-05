@@ -23,11 +23,36 @@ async def run_producer():
         # Creating a sample batch
         # Creating a sample batch
         events = [
-            WebhookEvent(event_type="payment.failed", target_url="...", payload={"i": 1}),
-            # WebhookEvent(event_type="payment.created", target_url="...", payload={"i": 2}),
-            # WebhookEvent(event_type="order.created", target_url="...", payload={"i": 3}),
-            # WebhookEvent(event_type="user.created", target_url="...", payload={"i": 4}),
-            # WebhookEvent(event_type="notification.sent", target_url="...", payload={"i": 5}),
+            # All five events pointing to httpbin.org/post
+            WebhookEvent(
+                event_type="payment.completed",
+                target_url="https://httpbin.org/post",
+                payload={"order_id": "ord_001", "amount": 100}
+            ),
+
+            WebhookEvent(
+                event_type="payment.completed",
+                target_url="https://httpbin.org/post",
+                payload={"order_id": "ord_002", "amount": 200}
+            ),
+
+            WebhookEvent(
+                event_type="payment.completed",
+                target_url="https://httpbin.org/post",
+                payload={"order_id": "ord_003", "amount": 300}
+            ),
+
+            WebhookEvent(
+                event_type="payment.completed",
+                target_url="https://httpbin.org/post",
+                payload={"order_id": "ord_004", "amount": 400}
+            ),
+
+            WebhookEvent(
+                event_type="payment.completed",
+                target_url="https://httpbin.org/post",
+                payload={"order_id": "ord_005", "amount": 500}
+            )
         ]
             
         await producer.publish_batch(events)

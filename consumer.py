@@ -4,8 +4,9 @@ import asyncio
 import aio_pika
 from aio_pika.abc import ConsumerTag
 from datetime import datetime, timezone
+from http_client import deliver_webhook
 
-from config import TOPIC_EXCHANGE, TOPIC_EXCHANGE_TYPE, RETRY_EXCHANGE, RETRY_WAIT_ROUTING_KEY, MAX_RETRIES, RETRY_EXCHANGE_TYPE, DLQ_ROUTING_KEY
+from config import TOPIC_EXCHANGE, TOPIC_EXCHANGE_TYPE, RETRY_EXCHANGE, MAX_RETRIES, RETRY_EXCHANGE_TYPE, DLQ_ROUTING_KEY
 from logger import get_logger
 from models import WebhookEvent
 
@@ -69,17 +70,21 @@ class WebhookConsumer:
         start_time = time.time()
 
         event: WebhookEvent | None = None
-        
+
+            
         try:
             raw_body = message.body.decode()
             event_dict = json.loads(raw_body)
             event = WebhookEvent.from_dict(event_dict)
             
-            event_id = event.event_id
-            target_url = event.target_url
-            event_type = event.event_type
+            if message.redelivered:
+                logger.warning("Redelivered message detected", extra={
+                    "worker_id": self.worker_id,
+                    "event_id": event.event_id,
+                    "note": "possible duplicate delivery to target"
 
-            # await asyncio.sleep(3)
+                })
+
 
             headers = message.headers or {}
             raw_retry_count = headers.get("retry_count", 0)
@@ -90,28 +95,103 @@ class WebhookConsumer:
             else:
                 current_retry_count = 0
 
-            raise Exception(f"Simulated delivery failure on attempt {current_retry_count + 1}")
-            
+            result = await deliver_webhook(
+                target_url=event.target_url,
+                payload=event.payload,
+                event_id=event.event_id,
+                event_type=event.event_type,
 
-            await message.ack() # explicit ack on success
-            
+            )
+
             processing_time_ms = int((time.time() - start_time) * 1000)
 
-            logger.info(
-                "Successfully processed webhook",
+                
+            if result.success:
+                await message.ack() # explicit ack on success
+        
+                logger.info(
+                    "Successfully processed webhook",
+                    extra={
+                        "worker_id": self.worker_id,
+                        "event_id": event.event_id,
+                        "event_type": event.event_type,
+                        "target_url": event.target_url,
+                        "status_code": result.status_code,
+                        "attempt_number": current_retry_count + 1,
+                        "retry_count": current_retry_count,
+                        "response_time_ms": result.response_time_ms,
+                        "processing_time_ms": processing_time_ms,
+                        "redelivered": message.redelivered
+                    }
+                )
+
+            elif not result.is_transient:
+                # 4xx -> dlq
+                await self._send_to_dlq(message, event, result.error, current_retry_count)
+                await message.ack()
+                logger.error(
+                "Permanent failure, send to DLQ",
                 extra={
                     "worker_id": self.worker_id,
-                    "event_id": event_id,
-                    "event_type": event_type,
-                    "target_url": target_url,
-                    "processing_time_ms": processing_time_ms
+                    "event_id": event.event_id,
+                    "event_type": event.event_type,
+                    "target_url": event.target_url,
+                    "status_code": result.status_code,
+                    "response_time_ms": result.response_time_ms,
+                    "processing_time_ms": processing_time_ms,
+                    "attempt_number": current_retry_count+1,
+                    "retry_count": current_retry_count,
+                    "error": result.error,
+                    "redelivered": message.redelivered
                 }
             )
+                
+            else:
+                # 5xx -> waiting queue
+                is_exhaust = current_retry_count >= MAX_RETRIES
+
+                if is_exhaust:
+                    # send to dlq
+                    await self._send_to_dlq(message, event, result.error, current_retry_count)
+                    await message.ack()
+
+                    logger.error("Retry budget exhausted, sent to DLQ", extra={
+                        "worker_id": self.worker_id,
+                        "event_id": event.event_id,
+                        "event_type": event.event_type,
+                        "target_url": event.target_url,
+                        "status_code": result.status_code,
+                        "response_time_ms": result.response_time_ms,
+                        "processing_time_ms": processing_time_ms,
+                        "attempt_number": current_retry_count+1,
+                        "retry_count": current_retry_count,
+                        "error": result.error,
+                        "redelivered": message.redelivered
+                    })
+                    
+
+                else:
+                    # send to waiting queue
+                    await self._send_to_retry(message, event, result.error, current_retry_count+1)
+                    await message.ack()
+                    logger.warning("Transient failure, queued for retry", extra={
+                        "event_id": event.event_id,
+                        "target_url": event.target_url,
+                        "status_code": result.status_code,
+                        "response_time_ms": result.response_time_ms,
+                        "processing_time_ms": processing_time_ms,
+                        "attempt_number": current_retry_count+1,
+                        "retry_count": current_retry_count,
+                        "error": result.error,
+                        "redelivered": message.redelivered
+                    })
 
         except Exception as e:
 
             # poison message(invalid json)
             if event is None:
+                await self._send_to_dlq(message, None, str(e), 0)
+                await message.ack()
                 logger.error(
                 "Poison message rejected to DLQ",
                 extra={
@@ -122,89 +202,92 @@ class WebhookConsumer:
                     "raw_body_snippet": message.body.decode(errors="replace")[:200]
                 }
             )
-                await message.reject(requeue=False) # reject immediately, don't requeue poison messages
-                return 
 
+            else:
+                headers = message.headers or {}
+                raw_retry_count = headers.get("retry_count", 0)
 
-            logger.error(
-                "Processing failed, handling failure...",
-                extra={
-                    "worker_id": self.worker_id,
-                    "error": str(e),
-                    "raw_body": message.body.decode()[:100]
-                }
-            )
-            await self._handle_failure(message, event, e)
+                # 2. Type Guard to make Pylance happy
+                if isinstance(raw_retry_count, int):
+                    current_retry_count = raw_retry_count
+                else:
+                    current_retry_count = 0
+
+                logger.error(
+                    "Processing failed, handling failure...",
+                    extra={
+                        "worker_id": self.worker_id,
+                        "error": str(e),
+                        "raw_body": message.body.decode()[:100]
+                    }
+                )
+
+        
+                await self._send_to_retry(message, event, str(e), current_retry_count+1)
+                await message.ack()
 
         finally:
             self._current_task = None  # clear after handler completes
 
 
-    async def _handle_failure(self,
+    async def _send_to_dlq(self,
         message: aio_pika.abc.AbstractIncomingMessage,
-        event: WebhookEvent, 
-        error: Exception
+        event: WebhookEvent|None,
+        error: str|None,
+        current_retry_count: int
     ):
         
         if self.retry_exchange is None:
             raise RuntimeError("Retry exchange is not initialized. Call setup() first.")
         
-        # read the current retry count from message headers.
-        # 1. Read headers safely
-        headers = message.headers or {}
-        raw_retry_count = headers.get("retry_count", 0)
-
-        # 2. Type Guard to make Pylance happy
-        if isinstance(raw_retry_count, int):
-            current_retry_count = raw_retry_count
+        if event is None:
+            event_id = None
+            correlation_id = None
+            event_dict = None
         else:
-            current_retry_count = 0 
-
-
-        is_exhausted = current_retry_count >= MAX_RETRIES
-
-        if is_exhausted:
-            # send to dlq for inspection.
-            # dlq only needs payload , because headers is used for transport.
-
-            dlq_payload = {
-                "original_event_id": event.event_id,
+            event_id = event.event_id
+            correlation_id = event.correlation_id
+            event_dict = event.to_dict()
+        
+        
+        
+        dlq_payload = {
+                "original_event_id": event_id,
                 "last_error": str(error),
                 "failed_at": datetime.now(timezone.utc).isoformat(),
                 "retry_count": current_retry_count,
-                "original_payload": event.to_dict()
+                "original_payload": event_dict,
+                "original_routing_key": message.routing_key
             }
 
 
 
-            # Construct the AMQP Envelope
-            dlq_message = aio_pika.Message(
-                body=json.dumps(dlq_payload).encode("utf-8"),
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,  
-                content_type="application/json",
-                correlation_id=event.correlation_id,            
-            )
+        # Construct the AMQP Envelope
+        dlq_message = aio_pika.Message(
+            body=json.dumps(dlq_payload).encode("utf-8"),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,  
+            content_type="application/json",
+            correlation_id=correlation_id,            
+        )
 
-            logger.error(
-                f"Worker {self.worker_id} exhausted retries. Sending to DLQ.",
-                extra={
-                    "event_id": event.event_id,
-                    "total_attempts": current_retry_count + 1,
-                    "final_retry_count":  current_retry_count,
-                    "failure_reason": str(error),
-                    "max_retries": MAX_RETRIES
-                    
-                }
-            )
+    
+        # republish it
+        await self.retry_exchange.publish(dlq_message, routing_key=DLQ_ROUTING_KEY)
+        
 
-            # publish it
-            await self.retry_exchange.publish(dlq_message, routing_key=DLQ_ROUTING_KEY)
-
-
-        else:
-            next_retry_count = current_retry_count + 1
-
-            new_headers = {
+    async def _send_to_retry(self,
+        message: aio_pika.abc.AbstractIncomingMessage,
+        event: WebhookEvent,
+        error: str|None,
+        next_retry_count: int
+    ):     
+        
+        if self.retry_exchange is None:
+            raise RuntimeError("Retry exchange is not initialized. Call setup() first.")
+        
+        headers = message.headers or {}
+        
+        new_headers = {
                 **headers,
                 "retry_count": next_retry_count,
                 "max_retries": MAX_RETRIES,
@@ -213,7 +296,7 @@ class WebhookConsumer:
             }
 
 
-            retry_message = aio_pika.Message(
+        retry_message = aio_pika.Message(
                 body=message.body, # Keep original body for retries
                 headers=new_headers,
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
@@ -221,32 +304,16 @@ class WebhookConsumer:
                 message_id=message.message_id,
                 content_type=message.content_type,
                 timestamp = message.timestamp,
-
-
             )
 
-            logger.warning(
-                f"Worker {self.worker_id} retrying message. Attempt {next_retry_count}/{MAX_RETRIES}",
-                extra={
-                    "event_id": event.event_id,
-                    "failure_reason": str(error),
-                    "retry_count": next_retry_count,
-                    "max_retries": MAX_RETRIES
-                }
-            )
+        if message.routing_key is None:
+            raise RuntimeError("no routing key")
 
-            if message.routing_key is None:
-                raise RuntimeError("no routing key")
-
-            # Publish to Retry queue
-            await self.retry_exchange.publish(
-                retry_message,
-                routing_key=message.routing_key
-            )
-
-        # 4. Ack the original message in both cases so it leaves the main queue
-        await message.ack()
-
+        # Publish to Retry queue
+        await self.retry_exchange.publish(
+            retry_message,
+            routing_key=message.routing_key
+        ) 
 
 
     async def start(self, shutdown_event: asyncio.Event):
