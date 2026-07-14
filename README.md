@@ -1,8 +1,16 @@
-# webhook-delivery-system
-
 Python • RabbitMQ • aio_pika • httpx • Async • Reliability Patterns
 
-`python` `rabbitmq` `async` `httpx` `pydantic` `distributed-systems` `status: active`
+![Python](https://img.shields.io/badge/python-3.10+-blue)
+![RabbitMQ](https://img.shields.io/badge/broker-rabbitmq-orange)
+![Async](https://img.shields.io/badge/type-async--webhook--delivery-green)
+![Status](https://img.shields.io/badge/status-learning--project-orange)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
+A production-grade asynchronous webhook delivery engine built on RabbitMQ, implementing topic-based routing, TTL-driven retry queues, dead-letter handling, and real HTTP delivery with transient/permanent failure classification.
+
+---
+
+# webhook-delivery-system
 
 A production-grade asynchronous webhook delivery engine built on RabbitMQ, implementing topic-based routing, TTL-driven retry queues, dead-letter handling, and real HTTP delivery with transient/permanent failure classification.
 
@@ -14,17 +22,15 @@ Built from scratch to understand — not just use — the delivery guarantees th
 
 Every system that delivers webhooks faces the same failure modes:
 
-- A receiving server is temporarily down — the event should retry, not disappear
-- A receiving endpoint no longer exists — retrying forever wastes resources and delays visibility into a real problem
-- A slow or hanging receiver can quietly stall an entire queue if nothing enforces a timeout
-- A consumer can crash mid-delivery — messages must survive that crash without being lost or silently duplicated
-- Every failure needs to be classified correctly, the first time, or the whole retry strategy collapses
+* A receiving server is temporarily down — the event should retry, not disappear
+* A receiving endpoint no longer exists — retrying forever wastes resources and delays visibility into a real problem
+* A slow or hanging receiver can quietly stall an entire queue if nothing enforces a timeout
+* A consumer can crash mid-delivery — messages must survive that crash without being lost or silently duplicated
+* Every failure needs to be classified correctly, the first time, or the whole retry strategy collapses
 
 This system solves all of these with layered infrastructure:
 
 **topic routing → retry wait queue (TTL) → dead-letter queue → real HTTP delivery → failure classification**
-
----
 
 ## Architecture
 
@@ -46,33 +52,59 @@ webhook_delivery_system/
 
 ## Request Flow
 
+```mermaid
+flowchart TD
+    A[Producer Publishes Event] --> B[Topic Exchange]
+    B -->|routed by event_type| C[Main Queue]
+    C --> D[Consumer Picks Up Message]
+    D --> E[HTTP POST via http_client]
+
+    E --> F{Response Outcome}
+
+    F -->|2xx Success| G[ACK — Delivery Complete]
+    F -->|4xx Permanent| H[Send to DLQ Immediately]
+    F -->|5xx or Timeout| I{Retry Budget Left?}
+
+    I -->|Yes| J[Retry Wait Queue — TTL]
+    J --> K[TTL Expires]
+    K --> C
+
+    I -->|No| H
 ```
-Producer
-   │
-   ▼
-Topic Exchange (webhook.events)
-   │  routed by event_type (e.g. payment.completed)
-   ▼
-Main Queue (webhook.critical / webhook.standard)
-   │
-   ▼
-Consumer picks up message
-   │
-   ▼
-http_client.deliver_webhook() → real HTTP POST
-   │
-   ├── 2xx ─────────────► ACK, delivery complete
-   │
-   ├── 4xx ─────────────► permanent failure → DLQ immediately, no retry
-   │
-   └── 5xx / timeout ───► transient failure
-                              │
-                              ├── retry_count < MAX_RETRIES → retry wait queue (TTL)
-                              │        │
-                              │        ▼
-                              │   TTL expires → back to main queue → re-attempt
-                              │
-                              └── retry_count exhausted → DLQ for inspection
+
+---
+
+## Circuit-Style Failure Classification
+
+```mermaid
+stateDiagram-v2
+    [*] --> Delivered: 2xx
+
+    [*] --> Permanent: 4xx
+    Permanent --> DLQ: no retry, ever
+
+    [*] --> Transient: 5xx / timeout
+    Transient --> RetryWait: retry_count < MAX_RETRIES
+    RetryWait --> Transient: TTL expires, re-attempt
+    Transient --> DLQ: retry_count exhausted
+```
+
+---
+
+## Retry Timeline Example
+
+```mermaid
+sequenceDiagram
+    participant Consumer
+    participant Target
+
+    Consumer->>Target: HTTP POST — Attempt 1
+    Target-->>Consumer: 503 Service Unavailable
+
+    Consumer->>Consumer: Route to Retry Wait Queue (TTL)
+
+    Consumer->>Target: HTTP POST — Attempt 2
+    Target-->>Consumer: 200 OK
 ```
 
 ---
