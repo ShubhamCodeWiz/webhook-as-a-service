@@ -46,7 +46,7 @@ async def run_producer():
                 event_type="payment.completed",
                 target_url="https://httpbin.org/post",
                 payload={"order_id": "ord_004", "amount": 400}
-            ),
+            ),w
 
             WebhookEvent(
                 event_type="payment.completed",
