@@ -1,4 +1,4 @@
-Python • RabbitMQ • aio_pika • httpx • Async • Reliability Patterns
+# webhook-delivery-system
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![RabbitMQ](https://img.shields.io/badge/broker-rabbitmq-orange)
@@ -6,15 +6,30 @@ Python • RabbitMQ • aio_pika • httpx • Async • Reliability Patterns
 ![Status](https://img.shields.io/badge/status-learning--project-orange)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-A production-grade asynchronous webhook delivery engine built on RabbitMQ, implementing topic-based routing, TTL-driven retry queues, dead-letter handling, and real HTTP delivery with transient/permanent failure classification.
+An asynchronous webhook delivery engine built on RabbitMQ — topic-based routing, TTL-driven retry queues, dead-letter handling, and real HTTP delivery with transient/permanent failure classification.
+
+Unlike most retry tutorials, this system never treats a `404` and a `503` the same way — a permanent failure short-circuits straight to the dead-letter queue, a transient one gets a bounded number of retries with no manual polling anywhere in the code.
+
+Verified end-to-end against all four real HTTP outcomes — `2xx`, `4xx`, `5xx`, and connection timeout — with zero message loss across a simulated consumer crash mid-delivery.
 
 ---
 
-# webhook-delivery-system
+## Quickstart
 
-A production-grade asynchronous webhook delivery engine built on RabbitMQ, implementing topic-based routing, TTL-driven retry queues, dead-letter handling, and real HTTP delivery with transient/permanent failure classification.
+```bash
+git clone https://github.com/ShubhamCodeWiz/webhook-delivery-system
+cd webhook-delivery-system
+pip install -r requirements.txt
+docker-compose up -d
 
-Built from scratch to understand — not just use — the delivery guarantees that power systems at Stripe, Shopify, and every major SaaS platform that sends webhooks.
+# terminal 1 — start a consumer
+python3 main.py consumer critical critical-worker-1
+
+# terminal 2 — publish a webhook event
+python3 main.py producer
+```
+
+You should see a structured JSON log line showing the HTTP status code, response time, and attempt number the moment the event is delivered.
 
 ---
 
@@ -31,6 +46,8 @@ Every system that delivers webhooks faces the same failure modes:
 This system solves all of these with layered infrastructure:
 
 **topic routing → retry wait queue (TTL) → dead-letter queue → real HTTP delivery → failure classification**
+
+---
 
 ## Architecture
 
@@ -74,7 +91,7 @@ flowchart TD
 
 ---
 
-## Circuit-Style Failure Classification
+## Failure Classification State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -109,9 +126,7 @@ sequenceDiagram
 
 ---
 
-## Failure Classification
-
-The core design decision of this system — every HTTP outcome is classified once, correctly, and routed accordingly.
+## Failure Classification Table
 
 | Outcome | Classification | Action |
 |---|---|---|
@@ -143,26 +158,7 @@ Permanent failures skip the retry budget entirely. Transient failures consume on
 
 ---
 
-## Installation
-
-```bash
-git clone https://github.com/ShubhamCodeWiz/webhook-delivery-system
-cd webhook-delivery-system
-pip install -r requirements.txt
-docker-compose up -d
-```
-
----
-
 ## Usage
-
-```bash
-# Start a consumer for the critical queue
-python3 main.py consumer critical critical-worker-1
-
-# Publish webhook events
-python3 main.py producer
-```
 
 ```python
 # http_client.py can also be used standalone
@@ -180,7 +176,7 @@ result = await deliver_webhook(
 
 ## Example Output
 
-A webhook that hits a `503`, retries with backoff via TTL, and succeeds on the second attempt:
+A webhook that hits a `503`, is queued via TTL, and succeeds on the second attempt:
 
 ```json
 {"level": "WARNING", "message": "Transient failure, queued for retry", "event_id": "c0076f2c-...", "status_code": 503, "attempt_number": 1, "retry_count": 0, "error": "Transient Failure: HTTP 503"}
@@ -235,25 +231,15 @@ Every failure path — permanent or transient — ends in either a DLQ publish o
 
 ## What I Would Add Next
 
-**Exponential backoff with jitter**
+**Exponential backoff with jitter** — retries currently use a fixed TTL; spacing retries out intelligently would avoid synchronized retry storms across many failing events.
 
-Currently retries use a fixed TTL. Replacing this with exponential backoff and full jitter (as validated by AWS research) would space out retries more intelligently and avoid synchronized retry storms across many failing events.
+**Circuit breaker around the HTTP call** — stop hammering a target that is completely down, failing fast instead of waiting out a full timeout on every attempt.
 
-**A resilient, retry-aware HTTP caller inside http_client.py's caller**
+**DLQ inspector** — a small CLI to browse `webhooks.dlq`, inspect `original_payload` and `last_error`, and optionally republish a message for manual replay.
 
-Wrapping outbound calls with a circuit breaker would stop hammering a target that is completely down, failing fast instead of waiting out a full timeout on every attempt.
+**Observability** — Prometheus counters for total deliveries, retries, DLQ sends, and response time histograms, to replace log-grepping with real dashboards.
 
-**DLQ inspector**
-
-A small CLI or dashboard to browse `webhooks.dlq`, inspect `original_payload` and `last_error`, and optionally republish a message back onto the main queue for a manual replay.
-
-**Observability**
-
-Prometheus counters for total deliveries, retries, DLQ sends, and response time histograms — to replace log-grepping with real dashboards.
-
-**Full test suite**
-
-Using `pytest` and `respx` for HTTP mocking, to test every branch of the failure classification tree without depending on `httpbin.org` being reachable.
+**Full test suite** — `pytest` + `respx` for HTTP mocking, to test every branch of the failure classification tree without depending on `httpbin.org` being reachable.
 
 ---
 
